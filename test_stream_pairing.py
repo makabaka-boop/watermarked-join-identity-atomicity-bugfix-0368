@@ -232,6 +232,102 @@ class PairingServiceTest(unittest.TestCase):
         self.assertEqual(len(service.current_pairs()), 4)
         self.assertStateMatchesReference(service)
 
+    def test_same_id_on_different_sides_is_scoped_per_side_on_retraction(self) -> None:
+        service = PairingService()
+        left_event = Event("same-id", "a", 10, 0)
+        right_event = Event("same-id", "a", 10, 0)
+        other_left = Event("left-other", "a", 11, 0)
+        other_right = Event("right-other", "a", 11, 0)
+        service.add(LEFT, left_event)
+        service.add(LEFT, other_left)
+        service.add(RIGHT, right_event)
+        service.add(RIGHT, other_right)
+
+        result = service.retract(LEFT, "same-id")
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            result.retracted,
+            (
+                Pair(left_event, right_event),
+                Pair(left_event, other_right),
+            ),
+        )
+        self.assertEqual(
+            result.pairs,
+            (
+                Pair(other_left, right_event),
+                Pair(other_left, other_right),
+            ),
+        )
+        self.assertStateMatchesReference(service)
+
+    def test_same_id_on_different_sides_is_scoped_per_side_on_correction(self) -> None:
+        service = PairingService()
+        left_event = Event("same-id", "a", 10, 0)
+        right_event = Event("same-id", "a", 10, 0)
+        other_left = Event("left-other", "a", 11, 0)
+        other_right = Event("right-other", "a", 11, 0)
+        service.add(LEFT, left_event)
+        service.add(LEFT, other_left)
+        service.add(RIGHT, right_event)
+        service.add(RIGHT, other_right)
+
+        corrected_left = Event("same-id", "b", 20, 1)
+        result = service.correct(LEFT, corrected_left)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            result.retracted,
+            (
+                Pair(left_event, right_event),
+                Pair(left_event, other_right),
+            ),
+        )
+        self.assertEqual(result.added, ())
+        self.assertEqual(
+            result.pairs,
+            (
+                Pair(other_left, right_event),
+                Pair(other_left, other_right),
+            ),
+        )
+        self.assertEqual(service.valid_events(RIGHT)[0:2], (right_event, other_right))
+        self.assertStateMatchesReference(service)
+
+    def test_mixed_numeric_and_string_identifiers_have_stable_pair_order(self) -> None:
+        service = PairingService()
+        service.add(LEFT, Event(1, "a", 10, 0))
+        service.add(LEFT, Event("1", "b", 10, 0))
+        service.add(RIGHT, Event(2, "b", 10, 0))
+
+        result = service.add(RIGHT, Event("2", "a", 10, 0))
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            [(p.left.id, p.right.id) for p in result.added],
+            [(1, "2")],
+        )
+        self.assertEqual(
+            [(p.left.id, p.right.id) for p in result.pairs],
+            [(1, "2"), ("1", 2)],
+        )
+        self.assertStateMatchesReference(service)
+
+    def test_mixed_identifiers_remain_correct_after_watermark(self) -> None:
+        service = PairingService()
+        service.add(LEFT, Event(1, "a", 10, 0))
+        service.add(LEFT, Event("1", "b", 10, 0))
+        service.add(RIGHT, Event(2, "b", 10, 0))
+        service.add(RIGHT, Event("2", "a", 10, 0))
+
+        service.advance_watermark(LEFT, 20)
+        result = service.advance_watermark(RIGHT, 20)
+
+        self.assertTrue(result.accepted)
+        self.assertTrue(all(pair.final for pair in result.pairs))
+        self.assertEqual(result.pairs, service.recompute_pairs_from_valid_events())
+
     @staticmethod
     def _active_count(service: PairingService, side: str, raw: dict[str, Event]) -> int:
         opposite = RIGHT if side == LEFT else LEFT
