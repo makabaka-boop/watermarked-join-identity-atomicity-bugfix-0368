@@ -10,6 +10,7 @@ that changes key/time can atomically withdraw old identities and add new ones.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Real
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 __all__ = [
@@ -28,6 +29,9 @@ MAX_ACTIVE_EVENTS = 500
 _TOLERANCE_MINUTES = 3
 
 PairKey = Tuple[object, object]
+EventRef = Tuple[str, object]
+SortValue = Tuple[int, object]
+PairSortKey = Tuple[SortValue, int, int, SortValue, SortValue]
 
 
 @dataclass(frozen=True)
@@ -85,13 +89,24 @@ class OperationResult:
         return bool(self.added or self.retracted)
 
 
-def pair_sort_key(pair: Pair) -> Tuple[object, int, int, object, object]:
+def _safe_sort_value(value: object) -> Tuple[int, object]:
+    """Build a deterministic ordering key for mixed numeric/string IDs."""
+    if value is None:
+        return 0, ()
+    if isinstance(value, Real):
+        return 1, value
+    if isinstance(value, str):
+        return 2, value
+    return 3, (type(value).__qualname__, repr(value))
+
+
+def pair_sort_key(pair: Pair) -> PairSortKey:
     return (
-        pair.key,
+        _safe_sort_value(pair.key),
         pair.left.minute,
         pair.right.minute,
-        pair.left.id,
-        pair.right.id,
+        _safe_sort_value(pair.left.id),
+        _safe_sort_value(pair.right.id),
     )
 
 
@@ -122,7 +137,7 @@ class PairingService:
 
         self._pairs: Dict[PairKey, Pair] = {}
         self._open_pairs: Set[PairKey] = set()
-        self._pairs_by_event: Dict[object, Set[PairKey]] = {}
+        self._pairs_by_event: Dict[EventRef, Set[PairKey]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -144,7 +159,6 @@ class PairingService:
         if error is not None:
             return self._rejected(error)
 
-        self._active[side][event.id] = event
         added = self._connect_event(side, event)
         return self._accepted(added=added)
 
@@ -195,7 +209,7 @@ class PairingService:
         if revision is not None and revision <= event.revision:
             return self._rejected("OLD_REVISION")
 
-        retracted = self._disconnect_event(event_id)
+        retracted = self._disconnect_event(side, event_id)
         del self._active[side][event_id]
         self._tombstones[side].add(event_id)
         return self._accepted(retracted=retracted)
@@ -227,7 +241,16 @@ class PairingService:
         events = list(self._active[side].values()) + list(
             self._sealed[side].values()
         )
-        return tuple(sorted(events, key=lambda event: (event.minute, event.id, event.key)))
+        return tuple(
+            sorted(
+                events,
+                key=lambda event: (
+                    event.minute,
+                    _safe_sort_value(event.id),
+                    _safe_sort_value(event.key),
+                ),
+            )
+        )
 
     def active_count(self, side: str) -> int:
         self._require_side(side)
@@ -257,25 +280,29 @@ class PairingService:
     # ------------------------------------------------------------------
 
     def _connect_event(self, side: str, event: Event) -> Tuple[Pair, ...]:
-        added: List[Pair] = []
         opposite = _other(side)
-
+        new_pairs: List[Pair] = []
         # A sealed opposite event cannot still be matchable: an event is
         # sealed only after the other side has passed its latest possible
         # matching minute.  Scanning active events is therefore complete.
         for other in self._active[opposite].values():
             pair = self._make_pair(side, event, other)
             if pair is not None:
-                self._add_pair(pair)
-                added.append(pair)
+                new_pairs.append(pair)
 
-        return self._sorted_pairs(added)
+        added = self._sorted_pairs(new_pairs)
+        self._active[side][event.id] = event
+        for pair in added:
+            self._add_pair(pair)
+
+        return added
 
     def _replace_event(
         self, side: str, old: Event, new: Event
     ) -> Tuple[Tuple[Pair, ...], Tuple[Pair, ...]]:
         opposite = _other(side)
-        old_keys = set(self._pairs_by_event.get(new.id, ()))
+        event_ref = (side, new.id)
+        old_keys = set(self._pairs_by_event.get(event_ref, ()))
 
         new_by_partner: Dict[object, Pair] = {}
         for other in self._active[opposite].values():
@@ -287,29 +314,33 @@ class PairingService:
         added_keys = new_keys - old_keys
         removed_keys = old_keys - new_keys
 
-        retracted = tuple(self._pairs[key] for key in removed_keys)
-        added = tuple(new_by_partner[self._partner_id(key, opposite)] for key in added_keys)
+        retracted = self._sorted_pairs(self._pairs[key] for key in removed_keys)
+        added = self._sorted_pairs(
+            new_by_partner[self._partner_id(key, opposite)] for key in added_keys
+        )
 
-        # All state changes happen here, after the replacement has been fully
-        # computed.  Retained identities receive their corrected snapshot.
+        # All state changes happen here, after the replacement and stable
+        # deltas have been fully computed.  Retained identities receive their
+        # corrected snapshot.
         self._active[side][new.id] = new
-        for key in removed_keys:
-            self._remove_pair(key)
-        for key in added_keys:
-            self._add_pair(new_by_partner[self._partner_id(key, opposite)])
+        for pair in retracted:
+            self._remove_pair(pair.identity)
+        for pair in added:
+            self._add_pair(pair)
         for pair in new_by_partner.values():
             if pair.identity in old_keys:
                 self._pairs[pair.identity] = pair
 
-        return self._sorted_pairs(added), self._sorted_pairs(retracted)
+        return added, retracted
 
-    def _disconnect_event(self, event_id: object) -> Tuple[Pair, ...]:
-        keys = set(self._pairs_by_event.get(event_id, ()))
-        retracted = tuple(self._pairs[key] for key in keys)
-        for key in keys:
-            self._remove_pair(key)
-        self._pairs_by_event.pop(event_id, None)
-        return self._sorted_pairs(retracted)
+    def _disconnect_event(self, side: str, event_id: object) -> Tuple[Pair, ...]:
+        event_ref = (side, event_id)
+        keys = set(self._pairs_by_event.get(event_ref, ()))
+        retracted = self._sorted_pairs(self._pairs[key] for key in keys)
+        for pair in retracted:
+            self._remove_pair(pair.identity)
+        self._pairs_by_event.pop(event_ref, None)
+        return retracted
 
     @staticmethod
     def _make_pair(side: str, event: Event, other: Event) -> Optional[Pair]:
@@ -325,18 +356,18 @@ class PairingService:
         key = pair.identity
         self._pairs[key] = pair
         self._open_pairs.add(key)
-        for event_id in (pair.left.id, pair.right.id):
-            self._pairs_by_event.setdefault(event_id, set()).add(key)
+        for event_ref in ((LEFT, pair.left.id), (RIGHT, pair.right.id)):
+            self._pairs_by_event.setdefault(event_ref, set()).add(key)
 
     def _remove_pair(self, key: PairKey) -> None:
         pair = self._pairs.pop(key)
         self._open_pairs.discard(key)
-        for event_id in (pair.left.id, pair.right.id):
-            keys = self._pairs_by_event.get(event_id)
+        for event_ref in ((LEFT, pair.left.id), (RIGHT, pair.right.id)):
+            keys = self._pairs_by_event.get(event_ref)
             if keys is not None:
                 keys.discard(key)
                 if not keys:
-                    del self._pairs_by_event[event_id]
+                    del self._pairs_by_event[event_ref]
 
     @staticmethod
     def _partner_id(key: PairKey, opposite_side: str) -> object:
